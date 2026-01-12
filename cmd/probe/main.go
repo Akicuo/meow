@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/patrickbucher/meow"
+	"github.com/valkey-io/valkey-go"
 )
 
 func main() {
@@ -22,6 +24,33 @@ func main() {
 		fmt.Fprintln(os.Stderr, "environment variable CONFIG_URL must be set")
 		os.Exit(1)
 	}
+	valkeyURL, okValkey := os.LookupEnv("VALKEY_URL")
+	fmt.Println("valkeyURL", valkeyURL)
+	if !okValkey {
+		fmt.Fprintln(os.Stderr, "environment variable VALKEY_URL must be set")
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	options := valkey.ClientOption{
+		InitAddress: []string{valkeyURL},
+		SelectDB:    28,
+	}
+	client, err := valkey.NewClient(options)
+	if err != nil {
+		log.Fatalf("create valkey client: %v", err)
+	}
+	defer client.Close()
+
+	if err = client.Do(ctx, client.B().Set().Key("purpose").Value("meow").Build()).Error(); err != nil {
+		log.Fatalf("set purpose=meow: %v", err)
+	}
+
+	result, err := client.Do(ctx, client.B().Get().Key("purpose").Build()).AsBytes()
+	if err != nil {
+		log.Fatalf("get purpose: %v", err)
+	}
+	fmt.Println(string(result))
 	endpoints := mustFetchEndpoints(configURL)
 
 	logFileName := fmt.Sprintf("meow-%v.log", time.Now().Format("2006-01-02T15-04-05"))

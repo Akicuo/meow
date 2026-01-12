@@ -2,7 +2,7 @@ package main
 
 import (
 	"bytes"
-	"encoding/csv"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,40 +12,43 @@ import (
 	"os"
 	"regexp"
 	"strconv"
-	"sync"
 
 	"github.com/patrickbucher/meow"
+	"github.com/valkey-io/valkey-go"
 )
-
-// Config maps the identifiers to endpoints.
-type Config map[string]*meow.Endpoint
-
-// ConcurrentConfig wraps the config together with a mutex.
-type ConcurrentConfig struct {
-	mu     sync.RWMutex
-	config Config
-}
-
-var cfg ConcurrentConfig
 
 func main() {
 	addr := flag.String("addr", "0.0.0.0", "listen to address")
 	port := flag.Uint("port", 8000, "listen on port")
-	file := flag.String("file", "config.csv", "CSV file to store the configuration")
 	flag.Parse()
 
 	log.SetOutput(os.Stderr)
 
-	cfg.config = mustReadConfig(*file)
+	// Read Valkey URL from environment variable
+	valkeyURL := os.Getenv("VALKEY_URL")
+	if valkeyURL == "" {
+		log.Fatal("VALKEY_URL environment variable is not set")
+	}
+
+	// Create Valkey connection
+	options := valkey.ClientOption{
+		InitAddress: []string{valkeyURL},
+		SelectDB:    28,
+	}
+	client, err := valkey.NewClient(options)
+	if err != nil {
+		log.Fatalf("create valkey client: %v", err)
+	}
+	defer client.Close()
 
 	http.HandleFunc("/endpoints/", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			getEndpoint(w, r)
+			getEndpoint(w, r, client)
 		case http.MethodPost:
-			postEndpoint(w, r, *file)
+			postEndpoint(w, r, client)
 		case http.MethodDelete:
-			deleteEndpoint(w, r, *file)
+			deleteEndpoint(w, r, client)
 		default:
 			log.Printf("request from %s rejected: method %s not allowed",
 				r.RemoteAddr, r.Method)
@@ -53,7 +56,7 @@ func main() {
 		}
 	})
 	http.HandleFunc("/endpoints", func(w http.ResponseWriter, r *http.Request) {
-		getEndpoints(w, r)
+		getEndpoints(w, r, client)
 	})
 
 	listenTo := fmt.Sprintf("%s:%d", *addr, *port)
@@ -61,7 +64,7 @@ func main() {
 	http.ListenAndServe(listenTo, nil)
 }
 
-func getEndpoint(w http.ResponseWriter, r *http.Request) {
+func getEndpoint(w http.ResponseWriter, r *http.Request, vk valkey.Client) {
 	log.Printf("GET %s from %s", r.URL, r.RemoteAddr)
 	identifier, err := extractEndpointIdentifier(r.URL.String())
 	if err != nil {
@@ -69,24 +72,62 @@ func getEndpoint(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	cfg.mu.RLock()
-	endpoint, ok := cfg.config[identifier]
-	cfg.mu.RUnlock()
-	if ok {
-		payload, err := endpoint.JSON()
-		if err != nil {
-			log.Printf("convert %v to JSON: %v", endpoint, err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Write(payload)
-	} else {
+
+	ctx := context.Background()
+
+	// Build the key for this endpoint
+	key := fmt.Sprintf("endpoints:%s", identifier)
+
+	// Get the hash values from Valkey
+	kvs, err := vk.Do(ctx, vk.B().Hgetall().Key(key).Build()).AsStrMap()
+	if err != nil {
+		log.Printf("hgetall %s: %v", key, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	// Check if the endpoint exists (empty map means key doesn't exist)
+	if len(kvs) == 0 {
 		log.Printf(`no such endpoint "%s"`, identifier)
 		w.WriteHeader(http.StatusNotFound)
+		return
 	}
+
+	// Convert status_online to uint16
+	statusOnline, err := strconv.ParseUint(kvs["status_online"], 10, 16)
+	if err != nil {
+		log.Printf("parse status_online for %s: %v", key, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	// Convert fail_after to uint8
+	failAfter, err := strconv.ParseUint(kvs["fail_after"], 10, 8)
+	if err != nil {
+		log.Printf("parse fail_after for %s: %v", key, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	payload := meow.EndpointPayload{
+		Identifier:   kvs["identifier"],
+		URL:          kvs["url"],
+		Method:       kvs["method"],
+		StatusOnline: uint16(statusOnline),
+		Frequency:    kvs["frequency"],
+		FailAfter:    uint8(failAfter),
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("serialize payload: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Write(data)
 }
 
-func postEndpoint(w http.ResponseWriter, r *http.Request, file string) {
+func postEndpoint(w http.ResponseWriter, r *http.Request, vk valkey.Client) {
 	log.Printf("POST %s from %s", r.URL, r.RemoteAddr)
 	buf := bytes.NewBufferString("")
 	io.Copy(buf, r.Body)
@@ -97,11 +138,22 @@ func postEndpoint(w http.ResponseWriter, r *http.Request, file string) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	cfg.mu.RLock()
-	_, exists := cfg.config[endpoint.Identifier]
-	cfg.mu.RUnlock()
+
+	ctx := context.Background()
+
+	// Build the key for this endpoint
+	key := fmt.Sprintf("endpoints:%s", endpoint.Identifier)
+
+	// Check if endpoint exists
+	exists, err := vk.Do(ctx, vk.B().Exists().Key(key).Build()).AsInt64()
+	if err != nil {
+		log.Printf("check exists %s: %v", key, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
 	var status int
-	if exists {
+	if exists > 0 {
 		// updating existing endpoint
 		identifierPathParam, err := extractEndpointIdentifier(r.URL.String())
 		if err != nil {
@@ -119,16 +171,28 @@ func postEndpoint(w http.ResponseWriter, r *http.Request, file string) {
 	} else {
 		status = http.StatusCreated
 	}
-	cfg.mu.Lock()
-	cfg.config[endpoint.Identifier] = endpoint
-	if err := writeConfig(cfg.config, file); err != nil {
-		status = http.StatusInternalServerError
+
+	// Store the endpoint in Valkey using HSET
+	err = vk.Do(ctx, vk.B().Hset().Key(key).
+		FieldValue().
+		FieldValue("identifier", endpoint.Identifier).
+		FieldValue("url", endpoint.URL.String()).
+		FieldValue("method", endpoint.Method).
+		FieldValue("status_online", strconv.FormatUint(uint64(endpoint.StatusOnline), 10)).
+		FieldValue("frequency", endpoint.Frequency.String()).
+		FieldValue("fail_after", strconv.FormatUint(uint64(endpoint.FailAfter), 10)).
+		Build()).Error()
+
+	if err != nil {
+		log.Printf("hset %s: %v", key, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
-	cfg.mu.Unlock()
+
 	w.WriteHeader(status)
 }
 
-func deleteEndpoint(w http.ResponseWriter, r *http.Request, file string) {
+func deleteEndpoint(w http.ResponseWriter, r *http.Request, vk valkey.Client) {
 	log.Printf("DELETE %s from %s", r.URL, r.RemoteAddr)
 	identifier, err := extractEndpointIdentifier(r.URL.String())
 	if err != nil {
@@ -137,27 +201,37 @@ func deleteEndpoint(w http.ResponseWriter, r *http.Request, file string) {
 		return
 	}
 
-	cfg.mu.Lock()
-	_, exists := cfg.config[identifier]
-	if !exists {
-		cfg.mu.Unlock()
+	ctx := context.Background()
+
+	// Build the key for this endpoint
+	key := fmt.Sprintf("endpoints:%s", identifier)
+
+	// Check if endpoint exists
+	exists, err := vk.Do(ctx, vk.B().Exists().Key(key).Build()).AsInt64()
+	if err != nil {
+		log.Printf("check exists %s: %v", key, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if exists == 0 {
 		log.Printf(`no such endpoint "%s"`, identifier)
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	delete(cfg.config, identifier)
-	if err := writeConfig(cfg.config, file); err != nil {
-		cfg.mu.Unlock()
-		log.Printf("write config: %v", err)
+	// Delete the endpoint from Valkey
+	err = vk.Do(ctx, vk.B().Del().Key(key).Build()).Error()
+	if err != nil {
+		log.Printf("delete %s: %v", key, err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	cfg.mu.Unlock()
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func getEndpoints(w http.ResponseWriter, r *http.Request) {
+func getEndpoints(w http.ResponseWriter, r *http.Request, vk valkey.Client) {
 	if r.Method != http.MethodGet {
 		log.Printf("request from %s rejected: method %s not allowed",
 			r.RemoteAddr, r.Method)
@@ -165,18 +239,55 @@ func getEndpoints(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("GET %s from %s", r.URL, r.RemoteAddr)
+
+	ctx := context.Background()
+
+	// Get all endpoint keys from Valkey
+	keys, err := vk.Do(ctx, vk.B().Keys().Pattern("endpoints:*").Build()).AsStrSlice()
+	if err != nil {
+		log.Printf("get keys for endpoints:*: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
 	payloads := make([]meow.EndpointPayload, 0)
-	for _, endpoint := range cfg.config {
+
+	// For each key, get the hash values
+	for _, key := range keys {
+		kvs, err := vk.Do(ctx, vk.B().Hgetall().Key(key).Build()).AsStrMap()
+		if err != nil {
+			log.Printf("hgetall %s: %v", key, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		// Convert status_online to uint16
+		statusOnline, err := strconv.ParseUint(kvs["status_online"], 10, 16)
+		if err != nil {
+			log.Printf("parse status_online for %s: %v", key, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		// Convert fail_after to uint8
+		failAfter, err := strconv.ParseUint(kvs["fail_after"], 10, 8)
+		if err != nil {
+			log.Printf("parse fail_after for %s: %v", key, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
 		payload := meow.EndpointPayload{
-			Identifier:   endpoint.Identifier,
-			URL:          endpoint.URL.String(),
-			Method:       endpoint.Method,
-			StatusOnline: endpoint.StatusOnline,
-			Frequency:    endpoint.Frequency.String(),
-			FailAfter:    endpoint.FailAfter,
+			Identifier:   kvs["identifier"],
+			URL:          kvs["url"],
+			Method:       kvs["method"],
+			StatusOnline: uint16(statusOnline),
+			Frequency:    kvs["frequency"],
+			FailAfter:    uint8(failAfter),
 		}
 		payloads = append(payloads, payload)
 	}
+
 	data, err := json.Marshal(payloads)
 	if err != nil {
 		log.Printf("serialize payloads: %v", err)
@@ -197,54 +308,4 @@ func extractEndpointIdentifier(endpoint string) (string, error) {
 			endpoint, endpointIdentifierPatternRaw)
 	}
 	return matches[1], nil
-}
-
-func writeConfig(config Config, configPath string) error {
-	file, err := os.Create(configPath)
-	if err != nil {
-		return fmt.Errorf(`open "%s" for write: %v`, configPath, err)
-	}
-
-	writer := csv.NewWriter(file)
-	defer file.Close()
-	for _, endpoint := range config {
-		record := []string{
-			endpoint.Identifier,
-			endpoint.URL.String(),
-			endpoint.Method,
-			strconv.Itoa(int(endpoint.StatusOnline)),
-			endpoint.Frequency.String(),
-			strconv.Itoa(int(endpoint.FailAfter)),
-		}
-		if err := writer.Write(record); err != nil {
-			return fmt.Errorf(`write endpoint "%s": %v`, endpoint, err)
-		}
-	}
-	writer.Flush()
-	return nil
-}
-
-func mustReadConfig(configPath string) Config {
-	file, err := os.Open(configPath)
-	if os.IsNotExist(err) {
-		// just start with an empty config
-		log.Printf(`the config file "%s" does not exist`, configPath)
-		return Config{}
-	}
-
-	config := make(Config, 0)
-	reader := csv.NewReader(file)
-	defer file.Close()
-	records, err := reader.ReadAll()
-	if err != nil {
-		log.Fatalf("the config file '%s' is malformed: %v", configPath, err)
-	}
-	for i, line := range records {
-		endpoint, err := meow.EndpointFromRecord(line)
-		if err != nil {
-			log.Fatalf(`line %d: "%s": %v`, i, line, err)
-		}
-		config[endpoint.Identifier] = endpoint
-	}
-	return config
 }
